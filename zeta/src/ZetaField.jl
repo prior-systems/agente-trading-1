@@ -9,6 +9,9 @@ include("vol/surface.jl")
 include("vol/hv.jl")
 include("regime/detector.jl")
 include("field/geometry.jl")
+include("strategy/classifier.jl")
+include("strategy/rules.jl")
+include("strategy/sizing.jl")
 
 export
     # Data clients
@@ -31,6 +34,12 @@ export
     RegimeState, RegimeDetector, fit_hmm, current_regime, regime_probabilities,
 
     # Zeta field
-    ZetaState, build_zeta_state, field_curvature, field_trajectory
+    ZetaState, build_zeta_state, field_curvature, field_trajectory,
+
+    # Strategy rule engine
+    MarketEnvironment, classify,
+    StrategyType, StrategyCandidate, select_candidates,
+    RiskLimits, DEFAULT_LIMITS, StrategyProposal, size_proposal,
+    run_rule_engine
 
 end
