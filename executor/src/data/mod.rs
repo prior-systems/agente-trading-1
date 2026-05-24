@@ -1,0 +1,99 @@
+pub mod thetadata;
+pub mod databento;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+// ── Canonical market events ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptionQuoteEvent {
+    pub ts: DateTime<Utc>,
+    pub root: String,
+    pub expiration: String,   // YYYYMMDD
+    pub strike: f64,
+    pub right: OptionRight,
+    pub bid: f64,
+    pub ask: f64,
+    pub bid_size: u32,
+    pub ask_size: u32,
+    pub underlying_price: f64,
+    pub implied_vol: f64,
+    // 1st order Greeks (from ThetaData)
+    pub delta: f64,
+    pub theta: f64,
+    pub vega: f64,
+    pub rho: f64,
+    // 2nd order Greeks (from ThetaData)
+    pub gamma: f64,
+    pub vanna: f64,
+    pub charm: f64,
+    pub vomma: f64,
+    pub veta: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuturesTradeEvent {
+    pub ts_ns: i64,           // nanoseconds since epoch (from Databento)
+    pub instrument_id: u64,
+    pub raw_symbol: String,   // e.g. "ESM5"
+    pub price: f64,
+    pub size: u64,
+    pub side: Side,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuturesMBOEvent {
+    pub ts_ns: i64,
+    pub instrument_id: u64,
+    pub order_id: u64,
+    pub price: f64,
+    pub size: u64,
+    pub side: Side,
+    pub action: MBOAction,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MarketEvent {
+    OptionQuote(OptionQuoteEvent),
+    FuturesTrade(FuturesTradeEvent),
+    FuturesMBO(FuturesMBOEvent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OptionRight { Call, Put }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Side { Bid, Ask, None }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MBOAction { Add, Cancel, Modify, Trade, Fill, Clear }
+
+impl TryFrom<char> for MBOAction {
+    type Error = anyhow::Error;
+    fn try_from(c: char) -> anyhow::Result<Self> {
+        match c {
+            'A' => Ok(MBOAction::Add),
+            'C' => Ok(MBOAction::Cancel),
+            'M' => Ok(MBOAction::Modify),
+            'T' => Ok(MBOAction::Trade),
+            'F' => Ok(MBOAction::Fill),
+            'R' => Ok(MBOAction::Clear),
+            _   => Err(anyhow::anyhow!("Unknown MBO action: {}", c)),
+        }
+    }
+}
+
+impl TryFrom<char> for Side {
+    type Error = anyhow::Error;
+    fn try_from(c: char) -> anyhow::Result<Self> {
+        match c {
+            'B' => Ok(Side::Bid),
+            'A' => Ok(Side::Ask),
+            'N' | 'Z' => Ok(Side::None),
+            _   => Err(anyhow::anyhow!("Unknown side: {}", c)),
+        }
+    }
+}
