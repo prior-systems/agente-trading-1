@@ -1,0 +1,18 @@
+# Rust build artifacts
+executor/target/
+
+# Julia artifacts
+zeta/Manifest.toml
+**/.julia_history
+
+# Environment / secrets
+.env
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
