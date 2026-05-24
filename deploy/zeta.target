@@ -1,0 +1,7 @@
+[Unit]
+Description=ZetaField Trading System
+# Starting/stopping this target starts/stops both services atomically
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

@@ -1,3 +1,5 @@
+pub mod persistence;
+
 use crate::data::MarketEvent;
 use anyhow::Result;
 use chrono::{DateTime, Utc};

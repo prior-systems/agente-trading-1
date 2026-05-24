@@ -1,0 +1,47 @@
+[Unit]
+Description=ZetaField Julia Engine
+Documentation=https://github.com/prior-systems/agente-trading-1
+After=network-online.target
+Wants=network-online.target
+# Engine can run independently — executor connects when ready
+PartOf=zeta.target
+
+[Service]
+Type=simple
+User=trading
+Group=trading
+WorkingDirectory=/opt/trading/zeta
+
+ExecStart=/usr/local/julia/bin/julia \
+    --project=/opt/trading/zeta \
+    --threads=4 \
+    --heap-size-hint=4G \
+    /opt/trading/zeta/src/server.jl
+
+# Graceful shutdown: SIGTERM → Julia catches it → flushes ZMQ → exits
+ExecStop=/bin/kill -TERM $MAINPID
+TimeoutStopSec=15
+
+Restart=on-failure
+RestartSec=10
+# Don't restart if it crashes 3 times in 5 minutes
+StartLimitBurst=3
+StartLimitIntervalSec=300
+
+# Environment
+EnvironmentFile=/opt/trading/.env
+Environment=JULIA_NUM_THREADS=4
+Environment=JULIA_DEPOT_PATH=/opt/trading/.julia
+Environment=LOG_LEVEL=info
+
+# Logging — journald captures stdout/stderr
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zeta-engine
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=zeta.target

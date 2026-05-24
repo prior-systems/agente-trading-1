@@ -1,0 +1,41 @@
+[Unit]
+Description=ZetaField Rust Executor
+Documentation=https://github.com/prior-systems/agente-trading-1
+After=network-online.target zeta-engine.service
+Wants=network-online.target
+PartOf=zeta.target
+
+[Service]
+Type=simple
+User=trading
+Group=trading
+WorkingDirectory=/opt/trading
+
+ExecStart=/opt/trading/executor/zeta-executor
+
+# On stop: log event before dying, attempt graceful position close
+ExecStopPost=/opt/trading/deploy/scripts/on_executor_stop.sh
+
+# Graceful shutdown window — give time to cancel open orders
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=300
+
+# Environment
+EnvironmentFile=/opt/trading/.env
+Environment=RUST_LOG=info,executor=debug
+Environment=ZMQ_ENDPOINT=ipc:///tmp/zeta.sock
+Environment=OMS_LOG_PATH=/var/log/trading/oms.jsonl
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zeta-executor
+
+NoNewPrivileges=true
+PrivateTmp=false  # needs /tmp/zeta.sock
+
+[Install]
+WantedBy=zeta.target

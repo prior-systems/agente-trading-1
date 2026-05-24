@@ -1,6 +1,7 @@
 mod agent;
 mod broker;
 mod data;
+mod ipc;
 mod orders;
 
 use agent::{RuleProposal, StrategyAgent};
@@ -25,9 +26,19 @@ async fn main() -> Result<()> {
     let (td_tx, mut td_rx) = tokio::sync::mpsc::channel(4096);
     let (db_tx, mut db_rx) = tokio::sync::mpsc::channel(4096);
     // Julia → Rust channel: ZetaState context + rule proposal
-    let (zeta_tx, mut zeta_rx) = tokio::sync::mpsc::channel::<ZetaSignal>(64);
+    let (zeta_tx, mut zeta_rx) = tokio::sync::mpsc::channel::<ipc::ZetaSignal>(64);
 
     // Data feeds
+    // ZMQ receiver — Rust binds, Julia connects
+    let zmq_endpoint = std::env::var("ZMQ_ENDPOINT")
+        .unwrap_or_else(|_| "ipc:///tmp/zeta.sock".to_string());
+    let receiver = ipc::ZetaReceiver::new(zmq_endpoint);
+    let zeta_tx_zmq = zeta_tx.clone();
+    tokio::spawn(async move {
+        receiver.run(zeta_tx_zmq).await
+            .expect("ZMQ receiver failed");
+    });
+
     let td_feed = data::thetadata::ThetaDataFeed::new(config.thetadata_key.clone(), td_tx);
     let db_feed = data::databento::DatabentoFeed::new(config.databento_key.clone(), db_tx);
 
@@ -54,7 +65,6 @@ async fn main() -> Result<()> {
                 oms.on_futures_event(event).await?;
             }
 
-            // ZetaState signal from Julia (via HTTP or stdin IPC)
             Some(signal) = zeta_rx.recv() => {
                 let oms_ref   = oms.clone();
                 let agent_ref = agent.clone();
@@ -69,18 +79,8 @@ async fn main() -> Result<()> {
     }
 }
 
-// ── ZetaSignal: message from Julia rule engine ────────────────────────────────
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ZetaSignal {
-    pub zeta_context: String,       // output of zeta_context_string()
-    pub needs_llm:    bool,
-    pub llm_questions: Vec<String>,
-    pub proposal:     RuleProposal,
-}
-
 async fn handle_zeta_signal(
-    signal: ZetaSignal,
+    signal: ipc::ZetaSignal,
     oms:    Arc<OrderManagementSystem>,
     agent:  Arc<StrategyAgent>,
 ) -> Result<()> {
@@ -89,7 +89,7 @@ async fn handle_zeta_signal(
         agent.consult(
             &signal.zeta_context,
             &signal.llm_questions,
-            &signal.proposal,
+            &signal.proposal.clone().into(),
         ).await?
     } else {
         // Clear case → echo rule engine proposal as decision (no LLM cost)
@@ -101,6 +101,7 @@ async fn handle_zeta_signal(
             target_vega:       signal.proposal.est_vega,
             target_dte:        signal.proposal.target_dte,
             entry_urgency:     signal.proposal.entry_urgency.clone(),
+
             reasoning:         "Rule engine clear signal — no LLM review needed.".to_string(),
             confidence:        0.85,
             macro_concerns:    None,

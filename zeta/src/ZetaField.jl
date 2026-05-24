@@ -12,6 +12,7 @@ include("field/geometry.jl")
 include("strategy/classifier.jl")
 include("strategy/rules.jl")
 include("strategy/sizing.jl")
+include("ipc.jl")
 
 export
     # Data clients
@@ -35,6 +36,9 @@ export
 
     # Zeta field
     ZetaState, build_zeta_state, field_curvature, field_trajectory,
+
+    # IPC
+    init_zmq!, close_zmq!, send_signal, send_heartbeat,
 
     # Strategy rule engine
     MarketEnvironment, classify,
