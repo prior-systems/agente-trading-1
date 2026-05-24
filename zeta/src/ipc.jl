@@ -45,6 +45,7 @@ struct ZetaSignalMsg
     needs_llm::Bool
     llm_questions::Vector{String}
     proposal::Dict{String, Any}
+    chain_candidates::Vector{Dict{String, Any}}
 end
 
 function _proposal_dict(p::StrategyProposal)
@@ -63,9 +64,34 @@ function _proposal_dict(p::StrategyProposal)
     )
 end
 
+# ── Candidate serialisation ───────────────────────────────────────────────────
+
+function _candidate_dict(c::StrikeCandidate)::Dict{String, Any}
+    Dict{String, Any}(
+        "root"             => c.root,
+        "expiration"       => Dates.format(c.expiration, "yyyymmdd"),  # YYYYMMDD for OCC symbol
+        "strike"           => c.strike,
+        "right"            => string(c.right),   # :call → "call", :put → "put"
+        "dte"              => c.dte,
+        "delta"            => c.delta,
+        "gamma"            => c.gamma,
+        "theta"            => c.theta,
+        "vega"             => c.vega,
+        "implied_vol"      => c.implied_vol,
+        "bid"              => c.bid,
+        "ask"              => c.ask,
+        "mid"              => c.mid,
+        "bid_size"         => c.bid_size,
+        "ask_size"         => c.ask_size,
+        "underlying_price" => c.underlying_price,
+        "open_interest"    => c.open_interest,
+        "spread_pct"       => c.spread_pct,
+    )
+end
+
 # ── Send ──────────────────────────────────────────────────────────────────────
 
-function send_signal(z::ZetaState, proposal::StrategyProposal)
+function send_signal(z::ZetaState, proposal::StrategyProposal, candidates::Vector{StrikeCandidate})
     !isassigned(_ZMQ_SOCKET) && @warn "ZMQ not initialized — call init_zmq!()" && return
 
     msg = ZetaSignalMsg(
@@ -75,6 +101,7 @@ function send_signal(z::ZetaState, proposal::StrategyProposal)
         proposal.needs_llm,
         proposal.llm_questions,
         _proposal_dict(proposal),
+        [_candidate_dict(c) for c in candidates],
     )
 
     payload = JSON3.write(msg)

@@ -87,7 +87,7 @@ function compute_field(
     td::ThetaDataClient,
     portfolio_greeks::NamedTuple,
     open_risk::Float64,
-)::Union{Tuple{ZetaState, StrategyProposal}, Nothing}
+)::Union{Tuple{ZetaState, StrategyProposal, Vector{StrikeCandidate}}, Nothing}
 
     isempty(state.prices) && return nothing
 
@@ -98,6 +98,9 @@ function compute_field(
         @warn "Option chain fetch failed for $(state.root)" exception=e
         return nothing
     end
+
+    # Parse chain into typed candidates (fixes TD-001: named-field access)
+    chain_candidates = parse_chain_snapshot(chain_raw, state.root, today())
 
     # 2. Build vol surface from chain data
     slices = _build_slices_from_chain(chain_raw, state)
@@ -143,7 +146,7 @@ function compute_field(
     # 8. Run rule engine
     proposal = run_rule_engine(z, PORTFOLIO_VALUE; open_risk=open_risk)
 
-    return (z, proposal)
+    return (z, proposal, chain_candidates)
 end
 
 # ── Build SmileSlice objects from ThetaData chain response ────────────────────
@@ -234,9 +237,9 @@ function main()
             try
                 result = compute_field(state, td, portfolio_greeks, open_risk)
                 if !isnothing(result)
-                    z, proposal = result
-                    send_signal(z, proposal)
-                    @info "Field computed" symbol=root strategy=string(proposal.candidate.type) needs_llm=proposal.needs_llm passes=proposal.passes_limits
+                    z, proposal, candidates = result
+                    send_signal(z, proposal, candidates)
+                    @info "Field computed" symbol=root strategy=string(proposal.candidate.type) needs_llm=proposal.needs_llm passes=proposal.passes_limits candidates=length(candidates)
                 end
             catch e
                 @error "Field computation failed for $root" exception=(e, catch_backtrace())

@@ -2,7 +2,7 @@ use super::Broker;
 use crate::orders::{Order, OrderLeg, OrderSide, OrderStatus, OrderType, TimeInForce};
 use anyhow::Result;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 const ALPACA_BASE_PAPER: &str = "https://paper-api.alpaca.markets/v2";

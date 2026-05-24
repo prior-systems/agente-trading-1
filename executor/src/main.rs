@@ -1,10 +1,11 @@
 mod agent;
 mod broker;
 mod data;
+mod execution;
 mod ipc;
 mod orders;
 
-use agent::{RuleProposal, StrategyAgent};
+use agent::StrategyAgent;
 use anyhow::Result;
 use orders::OrderManagementSystem;
 use std::sync::Arc;
@@ -41,16 +42,16 @@ async fn main() -> Result<()> {
 
     let td_feed = data::thetadata::ThetaDataFeed::new(config.thetadata_key.clone(), td_tx);
     let db_feed = data::databento::DatabentoFeed::new(config.databento_key.clone(), db_tx);
+    let equity_roots = config.equity_roots.clone();
+    let cme_symbols  = config.cme_symbols.clone();
 
-    let oms_td = oms.clone();
     tokio::spawn(async move {
-        td_feed.stream_options(&config.equity_roots).await
+        td_feed.stream_options(&equity_roots).await
             .expect("ThetaData feed failed");
     });
 
-    let oms_db = oms.clone();
     tokio::spawn(async move {
-        db_feed.stream_futures(&config.cme_symbols).await
+        db_feed.stream_futures(&cme_symbols).await
             .expect("Databento feed failed");
     });
 
@@ -133,9 +134,45 @@ async fn handle_zeta_signal(
         "Executing approved trade"
     );
 
-    // TODO: translate decision → Order legs → oms.submit()
-    // This requires the option chain data (strikes, expirations) which
-    // comes from ThetaData snapshot — next module.
+    // Translate decision → concrete order legs using live chain candidates
+    let greeks = (
+        signal.proposal.est_delta,
+        0.0,                          // gamma not in proposal — estimated per-leg
+        signal.proposal.est_vega,
+        signal.proposal.est_theta_day,
+    );
+    let strategy_id = uuid::Uuid::new_v4().to_string();
+
+    let order = match execution::build_order(
+        &decision.strategy_type,
+        &signal.chain_candidates,
+        final_contracts,
+        decision.target_dte,
+        &strategy_id,
+        greeks,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(
+                strategy = %decision.strategy_type,
+                error    = %e,
+                candidates = signal.chain_candidates.len(),
+                "Order construction failed — no trade submitted"
+            );
+            return Ok(());
+        }
+    };
+
+    let leg_summary: Vec<_> = order.legs.iter()
+        .map(|l| format!("{:?} {} x{}", l.side, l.symbol, l.quantity))
+        .collect();
+    info!(legs = ?leg_summary, "Order built — submitting to OMS");
+
+    // Stage in OMS (DashMap); broker submission is the next integration step
+    let order_id = oms.submit(order);
+    info!(%order_id, "Order staged in OMS");
+
+    // TODO: route order_id to AlpacaBroker::submit_order() and update OMS with broker_id
 
     Ok(())
 }

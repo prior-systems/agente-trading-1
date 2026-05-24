@@ -9,12 +9,13 @@ use zeromq::{PullSocket, Socket, SocketRecv};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ZetaSignal {
-    pub timestamp:     String,
-    pub symbol:        String,
-    pub zeta_context:  String,
-    pub needs_llm:     bool,
-    pub llm_questions: Vec<String>,
-    pub proposal:      RuleProposalMsg,
+    pub timestamp:        String,
+    pub symbol:           String,
+    pub zeta_context:     String,
+    pub needs_llm:        bool,
+    pub llm_questions:    Vec<String>,
+    pub proposal:         RuleProposalMsg,
+    pub chain_candidates: Vec<crate::execution::StrikeCandidate>,
 }
 
 // JSON representation of Julia's StrategyProposal
@@ -79,8 +80,11 @@ impl ZetaReceiver {
         loop {
             match socket.recv().await {
                 Ok(msg) => {
-                    let bytes = msg.into_vec();
-                    let text = match std::str::from_utf8(&bytes) {
+                    // ZmqMessage is a Vec<Bytes>; flatten all frames into one buffer
+                    let raw: Vec<u8> = msg.into_vec().into_iter()
+                        .flat_map(|frame| frame.to_vec())
+                        .collect();
+                    let text = match std::str::from_utf8(&raw) {
                         Ok(s) => s,
                         Err(e) => {
                             warn!("ZMQ message not valid UTF-8: {}", e);

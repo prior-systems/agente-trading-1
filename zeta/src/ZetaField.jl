@@ -4,6 +4,7 @@ using Dates, Statistics, LinearAlgebra, Logging
 
 include("data/thetadata.jl")
 include("data/databento.jl")
+include("data/chain.jl")
 include("greeks/black76.jl")
 include("vol/surface.jl")
 include("vol/hv.jl")
@@ -19,6 +20,10 @@ export
     ThetaDataClient, fetch_option_greeks, fetch_quote_greeks, fetch_trade_greeks,
     fetch_option_chain, fetch_index_price, fetch_open_interest,
     DatabentoClient, fetch_futures_definitions, fetch_mbo, fetch_trades_hist,
+
+    # Option chain parsing
+    StrikeCandidate, parse_chain_snapshot, closest_to_delta, is_liquid,
+    available_expirations, best_expiration, smile_slice,
 
     # Black-76
     black76_price, black76_greeks, implied_vol_black76, Black76Greeks,
