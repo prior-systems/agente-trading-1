@@ -18,9 +18,17 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    let dry_run = std::env::var("DRY_RUN")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    if dry_run {
+        info!("★ DRY-RUN mode — mock broker, no live feeds, no real orders");
+    }
+
     info!("Zeta Field Executor starting");
 
-    let config = Config::from_env()?;
+    let config = if dry_run { Config::dry_run_defaults() } else { Config::from_env()? };
 
     // ── Persistence ───────────────────────────────────────────────────────────
     let log = Arc::new(EventLog::new(&config.oms_log_path));
@@ -28,7 +36,6 @@ async fn main() -> Result<()> {
 
     let oms = Arc::new(OrderManagementSystem::new());
 
-    // Reconstruct OMS state from event log on startup
     let prior = log.reconstruct().await?;
     if !prior.open_orders.is_empty() {
         info!(open = prior.open_orders.len(), "Restoring open orders from event log");
@@ -38,25 +45,27 @@ async fn main() -> Result<()> {
     }
 
     // ── Brokers ───────────────────────────────────────────────────────────────
-    let tradier = Arc::new(broker::tradier::TradierBroker::new(
-        config.tradier_token.clone(),
-        config.tradier_account_id.clone(),
-        config.tradier_sandbox,
-    ));
-
-    let tradovate = Arc::new(
-        broker::tradovate::TradovateBroker::connect(
-            config.tradovate_username.clone(),
-            config.tradovate_password.clone(),
-            config.tradovate_cid,
-            config.tradovate_secret.clone(),
-            config.tradovate_device_id.clone(),
-            config.tradovate_demo,
-        ).await?,
-    );
-    tradovate.spawn_refresh_task();  // renew token every 23h in background
-
-    let broker: Arc<dyn Broker> = Arc::new(BrokerRouter::new(tradier, tradovate));
+    let broker: Arc<dyn Broker> = if dry_run {
+        Arc::new(broker::dryrun::DryRunBroker::new(50_000.0))
+    } else {
+        let tradier = Arc::new(broker::tradier::TradierBroker::new(
+            config.tradier_token.clone(),
+            config.tradier_account_id.clone(),
+            config.tradier_sandbox,
+        ));
+        let tradovate = Arc::new(
+            broker::tradovate::TradovateBroker::connect(
+                config.tradovate_username.clone(),
+                config.tradovate_password.clone(),
+                config.tradovate_cid,
+                config.tradovate_secret.clone(),
+                config.tradovate_device_id.clone(),
+                config.tradovate_demo,
+            ).await?,
+        );
+        tradovate.spawn_refresh_task();
+        Arc::new(BrokerRouter::new(tradier, tradovate))
+    };
 
     // ── LLM agent ─────────────────────────────────────────────────────────────
     let agent = Arc::new(StrategyAgent::new(config.anthropic_key.clone()));
@@ -76,23 +85,24 @@ async fn main() -> Result<()> {
             .expect("ZMQ receiver failed");
     });
 
-    // ── Market data feeds ─────────────────────────────────────────────────────
-    let td_feed = data::thetadata::ThetaDataFeed::new(config.thetadata_key.clone(), td_tx);
-    let db_feed = data::databento::DatabentoFeed::new(config.databento_key.clone(), db_tx);
-    let equity_roots = config.equity_roots.clone();
-    let cme_symbols  = config.cme_symbols.clone();
+    // ── Market data feeds (skipped in dry-run) ────────────────────────────────
+    if !dry_run {
+        let td_feed = data::thetadata::ThetaDataFeed::new(config.thetadata_key.clone(), td_tx);
+        let db_feed = data::databento::DatabentoFeed::new(config.databento_key.clone(), db_tx);
+        let equity_roots = config.equity_roots.clone();
+        let cme_symbols  = config.cme_symbols.clone();
 
-    tokio::spawn(async move {
-        td_feed.stream_options(&equity_roots).await
-            .expect("ThetaData feed failed");
-    });
+        tokio::spawn(async move {
+            td_feed.stream_options(&equity_roots).await
+                .expect("ThetaData feed failed");
+        });
+        tokio::spawn(async move {
+            db_feed.stream_futures(&cme_symbols).await
+                .expect("Databento feed failed");
+        });
+    }
 
-    tokio::spawn(async move {
-        db_feed.stream_futures(&cme_symbols).await
-            .expect("Databento feed failed");
-    });
-
-    info!("Zeta Field Executor ready");
+    info!("Zeta Field Executor ready — waiting for ZetaSignals");
 
     // ── Main event loop ───────────────────────────────────────────────────────
     loop {
@@ -205,7 +215,7 @@ async fn handle_zeta_signal(
     };
 
     // ── Buying power gate ─────────────────────────────────────────────────────
-    let needed   = execution::required_capital(&order);
+    let needed    = execution::required_capital(&order);
     let available = broker.account_buying_power().await.unwrap_or(0.0);
 
     if needed > available {
@@ -238,7 +248,6 @@ async fn handle_zeta_signal(
 
     info!(%broker_id, "Broker accepted order");
 
-    // Update order with broker confirmation
     order.broker_id = Some(broker_id.clone());
     order.status    = orders::OrderStatus::Submitted;
 
@@ -255,59 +264,72 @@ async fn handle_zeta_signal(
 
 #[derive(Debug)]
 struct Config {
-    // Data feeds
-    thetadata_key:      String,
-    databento_key:      String,
-    equity_roots:       Vec<String>,
-    cme_symbols:        Vec<String>,
-    // LLM
-    anthropic_key:      String,
-    // Tradier — options and stocks
-    tradier_token:      String,
-    tradier_account_id: String,
-    tradier_sandbox:    bool,
-    // Tradovate — futures
-    tradovate_username: String,
-    tradovate_password: String,
-    tradovate_cid:      i64,
-    tradovate_secret:   String,
+    thetadata_key:       String,
+    databento_key:       String,
+    equity_roots:        Vec<String>,
+    cme_symbols:         Vec<String>,
+    anthropic_key:       String,
+    tradier_token:       String,
+    tradier_account_id:  String,
+    tradier_sandbox:     bool,
+    tradovate_username:  String,
+    tradovate_password:  String,
+    tradovate_cid:       i64,
+    tradovate_secret:    String,
     tradovate_device_id: String,
-    tradovate_demo:     bool,
-    // OMS
-    oms_log_path:       String,
+    tradovate_demo:      bool,
+    oms_log_path:        String,
 }
 
 impl Config {
     fn from_env() -> Result<Self> {
         Ok(Config {
-            thetadata_key:      std::env::var("THETADATA_API_KEY")?,
+            thetadata_key:      std::env::var("THETADATA_API_KEY").unwrap_or_default(),
             databento_key:      std::env::var("DATABENTO_API_KEY")?,
             equity_roots:       std::env::var("EQUITY_ROOTS")
-                                    .unwrap_or_default()
+                                    .unwrap_or_else(|_| "SPY,QQQ".to_string())
                                     .split(',').map(String::from).collect(),
             cme_symbols:        std::env::var("CME_SYMBOLS")
-                                    .unwrap_or_default()
+                                    .unwrap_or_else(|_| "ES.FUT,NQ.FUT".to_string())
                                     .split(',').map(String::from).collect(),
             anthropic_key:      std::env::var("ANTHROPIC_API_KEY")?,
             tradier_token:      std::env::var("TRADIER_TOKEN")?,
             tradier_account_id: std::env::var("TRADIER_ACCOUNT_ID")?,
             tradier_sandbox:    std::env::var("TRADIER_SANDBOX")
                                     .map(|v| v == "true" || v == "1")
-                                    .unwrap_or(true),    // default sandbox
+                                    .unwrap_or(true),
             tradovate_username:  std::env::var("TRADOVATE_USERNAME")?,
             tradovate_password:  std::env::var("TRADOVATE_PASSWORD")?,
             tradovate_cid:       std::env::var("TRADOVATE_CID")
-                                     .unwrap_or_default()
-                                     .parse()
-                                     .unwrap_or(0),
+                                     .unwrap_or_default().parse().unwrap_or(0),
             tradovate_secret:    std::env::var("TRADOVATE_SECRET")?,
             tradovate_device_id: std::env::var("TRADOVATE_DEVICE_ID")
                                      .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
             tradovate_demo:      std::env::var("TRADOVATE_DEMO")
                                      .map(|v| v == "true" || v == "1")
-                                     .unwrap_or(true),   // default demo
+                                     .unwrap_or(true),
             oms_log_path:        std::env::var("OMS_LOG_PATH")
                                      .unwrap_or_else(|_| "/var/log/trading/oms.jsonl".to_string()),
         })
+    }
+
+    fn dry_run_defaults() -> Self {
+        Config {
+            thetadata_key:       "dry-run".to_string(),
+            databento_key:       "dry-run".to_string(),
+            equity_roots:        vec!["SPY".to_string()],
+            cme_symbols:         vec!["ES.FUT".to_string()],
+            anthropic_key:       std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "dry-run".to_string()),
+            tradier_token:       "dry-run".to_string(),
+            tradier_account_id:  "dry-run".to_string(),
+            tradier_sandbox:     true,
+            tradovate_username:  "dry-run".to_string(),
+            tradovate_password:  "dry-run".to_string(),
+            tradovate_cid:       0,
+            tradovate_secret:    "dry-run".to_string(),
+            tradovate_device_id: uuid::Uuid::new_v4().to_string(),
+            tradovate_demo:      true,
+            oms_log_path:        "/tmp/zeta_dryrun.jsonl".to_string(),
+        }
     }
 }

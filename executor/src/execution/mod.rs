@@ -115,13 +115,14 @@ pub fn build_order(
 
             match (sc, lc, sp, lp) {
                 (Some(sc), Some(lc), Some(sp), Some(lp)) => {
-                    // Verify strikes are in correct order
-                    if lc.strike <= sc.strike && lp.strike >= sp.strike {
+                    // lc (long call wing) must be above sc (short call): lc > sc
+                    // sp (short put) must be above lp (long put wing): sp > lp
+                    if lc.strike >= sc.strike && sp.strike >= lp.strike {
                         vec![sell_leg(sc, qty), buy_leg(lc, qty),
                              sell_leg(sp, qty), buy_leg(lp, qty)]
                     } else {
-                        bail!("IronCondor: strike ordering invalid (lc={:.0} sc={:.0} sp={:.0} lp={:.0})",
-                              lc.strike, sc.strike, sp.strike, lp.strike)
+                        bail!("IronCondor: strike ordering invalid (sc={:.0} lc={:.0} sp={:.0} lp={:.0})",
+                              sc.strike, lc.strike, sp.strike, lp.strike)
                     }
                 }
                 _ => bail!("IronCondor: could not find all 4 strikes near {}-day expiry", target_dte),
