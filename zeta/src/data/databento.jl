@@ -234,8 +234,10 @@ function fetch_statistics(
     ) for r in body]
 end
 
-# ── Order flow imbalance from MBO ─────────────────────────────────────────────
-# Core zeta field input: directional pressure from order flow
+# ── Order flow imbalance ──────────────────────────────────────────────────────
+# Two flavors:
+#   compute_ofi_from_mbo  — for historical MBO data (available up to 1 month back)
+#   compute_ofi_from_mbp1 — for live L1 data (Standard plan) and MBP-1 history
 
 struct OrderFlowMetrics
     period_start::Int64
@@ -243,13 +245,14 @@ struct OrderFlowMetrics
     instrument_id::Int64
     buy_volume::Int64
     sell_volume::Int64
-    ofi::Float64        # order flow imbalance = (buy - sell) / (buy + sell)
-    add_count::Int64    # new orders added
-    cancel_count::Int64 # orders cancelled
-    cancel_ratio::Float64  # cancel_count / add_count — proxy for HFT aggression
+    ofi::Float64        # order flow imbalance: (buy - sell) / (buy + sell)
+    add_count::Int64    # MBO-only: orders added (0 for MBP-1 derived)
+    cancel_count::Int64 # MBO-only: orders cancelled
+    cancel_ratio::Float64
 end
 
-function compute_ofi(records::Vector{MBORecord}, instrument_id::Int64)::OrderFlowMetrics
+# MBO-based OFI (historical data only — MBO not available in live Standard plan)
+function compute_ofi_from_mbo(records::Vector{MBORecord}, instrument_id::Int64)::OrderFlowMetrics
     buy_vol = sell_vol = add_ct = cancel_ct = 0
     t_start = typemax(Int64)
     t_end   = typemin(Int64)
@@ -271,3 +274,36 @@ function compute_ofi(records::Vector{MBORecord}, instrument_id::Int64)::OrderFlo
     return OrderFlowMetrics(t_start, t_end, instrument_id,
                             buy_vol, sell_vol, ofi, add_ct, cancel_ct, cr)
 end
+
+# MBP-1-based OFI (works for both live L1 and historical MBP-1 data).
+# Formula: OFI ≈ Σ(Δbid_sz - Δask_sz) across consecutive ticks.
+# Positive → net bid-side pressure (buying); negative → ask-side pressure.
+function compute_ofi_from_mbp1(records::Vector{MBP1Record}, instrument_id::Int64)::OrderFlowMetrics
+    t_start = typemax(Int64)
+    t_end   = typemin(Int64)
+    cumulative_ofi = 0
+    prev_bid_sz = prev_ask_sz = -1
+
+    for r in records
+        r.instrument_id != instrument_id && continue
+        t_start = min(t_start, r.ts_event)
+        t_end   = max(t_end, r.ts_event)
+
+        if prev_bid_sz >= 0
+            delta_bid = r.bid_sz - prev_bid_sz
+            delta_ask = r.ask_sz - prev_ask_sz
+            cumulative_ofi += delta_bid - delta_ask
+        end
+        prev_bid_sz = r.bid_sz
+        prev_ask_sz = r.ask_sz
+    end
+
+    n = count(r -> r.instrument_id == instrument_id, records)
+    ofi_normalized = n > 1 ? clamp(cumulative_ofi / (n * 100.0), -1.0, 1.0) : 0.0
+
+    return OrderFlowMetrics(t_start, t_end, instrument_id,
+                            0, 0, ofi_normalized, 0, 0, 0.0)
+end
+
+# Backward-compatible alias
+const compute_ofi = compute_ofi_from_mbo

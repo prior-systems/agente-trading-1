@@ -1,7 +1,8 @@
-use super::{FuturesMBOEvent, FuturesTradeEvent, MBOAction, MarketEvent, Side};
+use super::{FuturesMBP1Event, FuturesTradeEvent, MarketEvent, Side};
 use anyhow::Result;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tokio::sync::mpsc::Sender;
 use tokio_tungstenite::connect_async;
 use tracing::{error, info, warn};
@@ -13,7 +14,6 @@ pub struct DatabentoFeed {
     tx: Sender<MarketEvent>,
 }
 
-// Databento live API auth + subscription messages
 #[derive(Serialize)]
 struct AuthMessage<'a> {
     auth:    &'a str,
@@ -22,26 +22,33 @@ struct AuthMessage<'a> {
 
 #[derive(Serialize)]
 struct SubscribeMessage<'a> {
-    action:  &'a str,
-    schema:  &'a str,
-    symbols: &'a str,
+    action:   &'a str,
+    schema:   &'a str,
+    symbols:  &'a str,
+    encoding: &'a str,   // request JSON-encoded records
 }
 
-// Databento DBN record — subset of fields we care about
+// Databento DBN record — fields for mbp-1 + trades
 #[derive(Debug, Deserialize)]
 struct DBNRecord {
     #[serde(rename = "hd")]
     header: DBNHeader,
+    // Trade price/size (also present in mbp-1 as last aggressor)
     #[serde(default)]
-    price: i64,       // fixed-point: divide by 1e9 for float
+    price: i64,
     #[serde(default)]
     size: u64,
     #[serde(default)]
     side: Option<String>,
-    #[serde(default)]
-    action: Option<String>,
-    #[serde(default)]
-    order_id: Option<u64>,
+    // MBP-1: best bid/ask (level 0)
+    #[serde(default, rename = "bid_px_00")]
+    bid_px: i64,
+    #[serde(default, rename = "ask_px_00")]
+    ask_px: i64,
+    #[serde(default, rename = "bid_sz_00")]
+    bid_sz: u32,
+    #[serde(default, rename = "ask_sz_00")]
+    ask_sz: u32,
     #[serde(default)]
     sequence: u64,
 }
@@ -52,7 +59,13 @@ struct DBNHeader {
     ts_event: i64,
     #[serde(rename = "instrument_id")]
     instrument_id: u64,
-    rtype: u8,   // 0=mbo, 1=mbp-1, 2=mbp-10, 4=trades
+    rtype: u8,   // 1=mbp-1, 4=trades
+}
+
+// Per-instrument state for incremental OFI from MBP-1 ticks
+struct BookState {
+    bid_sz: u32,
+    ask_sz: u32,
 }
 
 impl DatabentoFeed {
@@ -74,7 +87,6 @@ impl DatabentoFeed {
         })?;
         write.send(Message::Text(auth_msg.into())).await?;
 
-        // Wait for auth ack
         if let Some(Ok(Message::Text(resp))) = read.next().await {
             let v: serde_json::Value = serde_json::from_str(&resp)?;
             if v.get("type").and_then(|t| t.as_str()) != Some("auth_response") {
@@ -83,22 +95,27 @@ impl DatabentoFeed {
             info!("Databento authenticated");
         }
 
-        // Subscribe to MBO (most granular) + trades
+        // Subscribe to mbp-1 (L1 bid/ask — Standard plan live) + trades
+        // MBO is only available in historical (≤1 month back), not live
         let sym_str = symbols.join(",");
-        for schema in &["mbo", "trades"] {
+        for schema in &["mbp-1", "trades"] {
             let sub = serde_json::to_string(&SubscribeMessage {
-                action: "subscribe",
+                action:   "subscribe",
                 schema,
-                symbols: &sym_str,
+                symbols:  &sym_str,
+                encoding: "json",
             })?;
             write.send(Message::Text(sub.into())).await?;
         }
-        info!("Databento subscribed to {} symbols", symbols.len());
+        info!("Databento subscribed: mbp-1 + trades for {} symbols", symbols.len());
+
+        // OFI: track previous best bid/ask sizes per instrument
+        let mut book: HashMap<u64, BookState> = HashMap::new();
 
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    match self.parse_record(&text) {
+                    match self.parse_record(&text, &mut book) {
                         Ok(Some(event)) => {
                             if self.tx.send(event).await.is_err() {
                                 break;
@@ -107,6 +124,11 @@ impl DatabentoFeed {
                         Ok(None) => {}
                         Err(e) => warn!("Databento parse error: {} | raw: {}", e, &text[..text.len().min(100)]),
                     }
+                }
+                Ok(Message::Binary(bytes)) => {
+                    // Databento may send binary DBN frames; log and skip until
+                    // we add a proper DBN decoder
+                    warn!("Databento binary frame ({} bytes) — DBN decoder not implemented", bytes.len());
                 }
                 Ok(Message::Close(_)) => {
                     info!("Databento WebSocket closed");
@@ -122,7 +144,7 @@ impl DatabentoFeed {
         Ok(())
     }
 
-    fn parse_record(&self, text: &str) -> Result<Option<MarketEvent>> {
+    fn parse_record(&self, text: &str, book: &mut HashMap<u64, BookState>) -> Result<Option<MarketEvent>> {
         let rec: DBNRecord = serde_json::from_str(text)?;
         let hd = &rec.header;
 
@@ -132,32 +154,45 @@ impl DatabentoFeed {
             .unwrap_or(Side::None);
 
         match hd.rtype {
-            4 => {   // trades
+            4 => {
+                // Trade record
                 Ok(Some(MarketEvent::FuturesTrade(FuturesTradeEvent {
-                    ts_ns: hd.ts_event,
+                    ts_ns:         hd.ts_event,
                     instrument_id: hd.instrument_id,
-                    raw_symbol: String::new(),   // enriched separately from definition cache
-                    price: rec.price as f64 / 1e9,
-                    size: rec.size,
+                    raw_symbol:    String::new(),
+                    price:         rec.price as f64 / 1e9,
+                    size:          rec.size,
                     side,
-                    sequence: rec.sequence,
+                    sequence:      rec.sequence,
                 })))
             }
-            0 => {   // mbo
-                let action = rec.action.as_deref()
-                    .and_then(|s| s.chars().next())
-                    .map(|c| MBOAction::try_from(c).unwrap_or(MBOAction::Add))
-                    .unwrap_or(MBOAction::Add);
+            1 => {
+                // MBP-1: best bid/ask snapshot + incremental OFI
+                let bid_px = rec.bid_px as f64 / 1e9;
+                let ask_px = rec.ask_px as f64 / 1e9;
+                let bid_sz = rec.bid_sz;
+                let ask_sz = rec.ask_sz;
 
-                Ok(Some(MarketEvent::FuturesMBO(FuturesMBOEvent {
-                    ts_ns: hd.ts_event,
+                // OFI = Δbid_sz - Δask_sz (positive = net buying pressure)
+                let ofi = match book.get(&hd.instrument_id) {
+                    Some(prev) => {
+                        (bid_sz as i64 - prev.bid_sz as i64)
+                        - (ask_sz as i64 - prev.ask_sz as i64)
+                    }
+                    None => 0,
+                };
+
+                book.insert(hd.instrument_id, BookState { bid_sz, ask_sz });
+
+                Ok(Some(MarketEvent::FuturesMBP1(FuturesMBP1Event {
+                    ts_ns:         hd.ts_event,
                     instrument_id: hd.instrument_id,
-                    order_id: rec.order_id.unwrap_or(0),
-                    price: rec.price as f64 / 1e9,
-                    size: rec.size,
-                    side,
-                    action,
-                    sequence: rec.sequence,
+                    bid_px,
+                    ask_px,
+                    bid_sz,
+                    ask_sz,
+                    ofi,
+                    sequence:      rec.sequence,
                 })))
             }
             _ => Ok(None),

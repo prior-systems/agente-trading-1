@@ -61,7 +61,7 @@ $LIVE_MODE && echo -e "  ${RED}⚠  MODO LIVE — usando cuentas reales${NC}"
 section "1. Variables de entorno"
 
 ALL_VARS=(
-    THETADATA_API_KEY DATABENTO_API_KEY ANTHROPIC_API_KEY
+    DATABENTO_API_KEY ANTHROPIC_API_KEY
     TRADIER_TOKEN TRADIER_ACCOUNT_ID
     TRADOVATE_USERNAME TRADOVATE_PASSWORD TRADOVATE_CID TRADOVATE_SECRET
 )
@@ -184,26 +184,20 @@ fi
 
 # ── 5. ThetaData ──────────────────────────────────────────────────────────────
 section "5. ThetaData (option chain + Greeks)"
+# ThetaData v3 runs as a local terminal at 127.0.0.1:25503 — no auth in HTTP requests
 
-THETA_RESP=$(curl -sf \
-    "https://api.thetadata.us/v2/bulk_snapshot/option/quote?root=SPY&exp=0&use_csv=false" \
-    -H "Accept: application/json" \
-    -u "$THETADATA_API_KEY:" 2>&1) && THETA_OK=true || THETA_OK=false
-
-# ThetaData can also use query param
-if ! $THETA_OK || ! echo "$THETA_RESP" | grep -qE "header|response|error"; then
-    THETA_RESP=$(curl -sf \
-        "https://api.thetadata.us/v2/snapshot/option/quote?root=SPY&use_csv=false&apikey=$THETADATA_API_KEY" \
-        -H "Accept: application/json" 2>&1) && THETA_OK=true || THETA_OK=false
-fi
+THETA_RESP=$(curl -sf --max-time 5 \
+    "http://127.0.0.1:25503/v3/bulk_snapshot/option/greeks?root=SPY&exp=0&use_csv=false" \
+    -H "Accept: application/json" 2>&1) && THETA_OK=true || THETA_OK=false
 
 if $THETA_OK && echo "$THETA_RESP" | grep -qE "header|response"; then
-    ok "ThetaData conectado — API key válida"
-elif echo "$THETA_RESP" | grep -qi "unauthorized\|forbidden\|invalid"; then
-    fail "ThetaData: API key inválida o sin permisos"
+    ok "Theta Terminal corriendo y respondiendo"
+elif echo "$THETA_RESP" | grep -qi "refused\|connect"; then
+    fail "ThetaData: Theta Terminal no está corriendo en 127.0.0.1:25503"
+    info "Inicia el Theta Terminal antes de arrancar el sistema"
 else
-    # ThetaData puede requerir suscripción activa — 200 con header vacío también es OK
-    ok "ThetaData: conexión OK (verifica que tu suscripción incluya options)"
+    fail "ThetaData: respuesta inesperada del terminal local"
+    info "Preview: ${THETA_RESP:0:200}"
 fi
 
 # ── 6. Databento ──────────────────────────────────────────────────────────────

@@ -3,7 +3,6 @@ using Dates, Logging, JSON3
 
 # ── Config from environment ───────────────────────────────────────────────────
 
-const THETADATA_KEY    = ENV["THETADATA_API_KEY"]
 const DATABENTO_KEY    = ENV["DATABENTO_API_KEY"]
 const EQUITY_ROOTS     = split(get(ENV, "EQUITY_ROOTS", "SPY,QQQ"), ",")
 const CME_SYMBOLS      = split(get(ENV, "CME_SYMBOLS",  "ES.FUT,NQ.FUT"), ",")
@@ -204,7 +203,7 @@ function main()
     setup_signal_handlers!()
 
     # Initialize data clients
-    td = ThetaDataClient(THETADATA_KEY)
+    td = ThetaDataClient()   # local Theta Terminal at 127.0.0.1:25503 — no key in requests
     db = DatabentoClient(DATABENTO_KEY)
 
     # Initialize ZMQ

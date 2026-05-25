@@ -165,19 +165,22 @@ impl OrderManagementSystem {
     pub async fn on_futures_event(&self, event: MarketEvent) -> Result<()> {
         match event {
             MarketEvent::FuturesTrade(t) => {
-                // Update mark price for futures positions
                 let key = format!("FUT_{}", t.instrument_id);
                 if let Some(mut pos) = self.positions.get_mut(&key) {
-                    // Mark to market — futures delta = 1 per contract
-                    let _ = t.price;  // used for P&L calculation (not shown)
+                    let _ = t.price;
                     let _ = pos.delta;
                 }
             }
-            MarketEvent::FuturesMBO(mbo) => {
-                // Order flow tracking for zeta field — not updating positions
-                let _ = mbo;
+            MarketEvent::FuturesMBP1(m) => {
+                // Mid-price for mark-to-market; OFI flows to ZetaState via Julia
+                let key = format!("FUT_{}", m.instrument_id);
+                if let Some(mut pos) = self.positions.get_mut(&key) {
+                    let mid = (m.bid_px + m.ask_px) / 2.0;
+                    let _ = mid;
+                    let _ = pos.delta;
+                }
             }
-            _ => {}
+            MarketEvent::FuturesMBO(_) | _ => {}
         }
         Ok(())
     }

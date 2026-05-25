@@ -34,7 +34,7 @@ pub struct OptionQuoteEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FuturesTradeEvent {
-    pub ts_ns: i64,           // nanoseconds since epoch (from Databento)
+    pub ts_ns: i64,           // nanoseconds since epoch
     pub instrument_id: u64,
     pub raw_symbol: String,   // e.g. "ESM5"
     pub price: f64,
@@ -43,6 +43,21 @@ pub struct FuturesTradeEvent {
     pub sequence: u64,
 }
 
+// L1 best bid/ask snapshot from Databento mbp-1 schema (Standard plan live data)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuturesMBP1Event {
+    pub ts_ns: i64,
+    pub instrument_id: u64,
+    pub bid_px: f64,
+    pub ask_px: f64,
+    pub bid_sz: u32,
+    pub ask_sz: u32,
+    // Incremental OFI: Δbid_sz - Δask_sz vs previous tick
+    pub ofi: i64,
+    pub sequence: u64,
+}
+
+// Kept for historical data (MBO available in Databento 1-month history, not live)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FuturesMBOEvent {
     pub ts_ns: i64,
@@ -59,7 +74,8 @@ pub struct FuturesMBOEvent {
 pub enum MarketEvent {
     OptionQuote(OptionQuoteEvent),
     FuturesTrade(FuturesTradeEvent),
-    FuturesMBO(FuturesMBOEvent),
+    FuturesMBP1(FuturesMBP1Event),
+    FuturesMBO(FuturesMBOEvent),    // historical only
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

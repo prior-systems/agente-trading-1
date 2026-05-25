@@ -1,15 +1,15 @@
 using HTTP, JSON3, Dates
 
-# ThetaData v2 REST API
-# Docs: https://http-docs.thetadata.us
-const THETADATA_BASE = "https://api.thetadata.us/v2"
+# ThetaData v3 — local Theta Terminal
+# The Theta Terminal desktop app must be running for these calls to work.
+# No authentication in HTTP requests; the terminal handles auth internally.
+const THETADATA_BASE = "http://127.0.0.1:25503/v3"
 
 struct ThetaDataClient
-    api_key::String
     base_url::String
 end
 
-ThetaDataClient(api_key::String) = ThetaDataClient(api_key, THETADATA_BASE)
+ThetaDataClient() = ThetaDataClient(THETADATA_BASE)
 
 # ── Response types ────────────────────────────────────────────────────────────
 
@@ -72,14 +72,14 @@ end
 
 function _get(client::ThetaDataClient, path::String, params::Dict)
     url = "$(client.base_url)$(path)"
-    headers = ["Accept" => "application/json",
-               "Authorization" => "Bearer $(client.api_key)"]
-    resp = HTTP.get(url; query=params, headers=headers)
+    # Local terminal — no auth header; request JSON explicitly
+    all_params = merge(Dict("use_csv" => "false"), params)
+    resp = HTTP.get(url; query=all_params, headers=["Accept" => "application/json"])
     body = JSON3.read(String(resp.body))
     return body
 end
 
-# Parse array-of-arrays response into typed structs
+# Parse array-of-arrays response into typed structs.
 # ThetaData returns: {"header": {"format": [...]}, "response": [[...], ...]}
 function _parse_response(body, T::Type, mapping::Vector{Symbol})
     fmt = [Symbol(f) for f in body.header.format]
@@ -176,8 +176,8 @@ function fetch_trade_greeks(
     return _parse_response(body, TradeGreeks2, Symbol[])
 end
 
-# Returns all strikes × expirations for a root on a given date
-# Used to build the full vol surface
+# Returns all strikes × expirations for a root on a given date.
+# Used to build the full vol surface.
 function fetch_option_chain(
     client::ThetaDataClient,
     root::String,
@@ -187,7 +187,7 @@ function fetch_option_chain(
         "root" => root,
         "date" => Dates.format(date, "yyyymmdd"),
     )
-    body = _get(client, "/snapshot/option/greeks", params)
+    body = _get(client, "/bulk_snapshot/option/greeks", params)
     return body
 end
 
@@ -197,13 +197,13 @@ function fetch_open_interest(
     date::Date
 )::Int64
     params = Dict(
-        "root"  => contract.root,
-        "exp"   => Dates.format(contract.expiration, "yyyymmdd"),
+        "root"   => contract.root,
+        "exp"    => Dates.format(contract.expiration, "yyyymmdd"),
         "strike" => string(round(Int, contract.strike * 1000)),
-        "right" => contract.right == :call ? "C" : "P",
-        "date"  => Dates.format(date, "yyyymmdd"),
+        "right"  => contract.right == :call ? "C" : "P",
+        "date"   => Dates.format(date, "yyyymmdd"),
     )
-    body = _get(client, "/snapshot/option/open_interest", params)
+    body = _get(client, "/at_time/option/open_interest", params)
     # response: [[ms_of_day, open_interest, date]]
     return Int64(body.response[1][2])
 end
@@ -219,6 +219,6 @@ function fetch_index_price(
         "start_date" => Dates.format(start_date, "yyyymmdd"),
         "end_date"   => Dates.format(end_date, "yyyymmdd"),
     )
-    body = _get(client, "/hist/index/price", params)
+    body = _get(client, "/hist/stock/eod", params)
     return body
 end
