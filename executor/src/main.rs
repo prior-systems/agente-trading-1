@@ -204,10 +204,24 @@ async fn handle_zeta_signal(
         }
     };
 
+    // ── Buying power gate ─────────────────────────────────────────────────────
+    let needed   = execution::required_capital(&order);
+    let available = broker.account_buying_power().await.unwrap_or(0.0);
+
+    if needed > available {
+        tracing::warn!(
+            strategy  = %decision.strategy_type,
+            needed    = needed,
+            available = available,
+            "Trade blocked — insufficient buying power"
+        );
+        return Ok(());
+    }
+
     let leg_summary: Vec<_> = order.legs.iter()
         .map(|l| format!("{:?} {} x{}", l.side, l.symbol, l.quantity))
         .collect();
-    info!(legs = ?leg_summary, "Submitting to broker");
+    info!(legs = ?leg_summary, needed, available, "Submitting to broker");
 
     // ── Broker submission ─────────────────────────────────────────────────────
     let broker_id = match broker.submit_order(&order).await {

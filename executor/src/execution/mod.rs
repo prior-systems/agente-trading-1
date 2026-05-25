@@ -226,6 +226,34 @@ pub fn build_order(
     Ok(Order::new(strategy_id, legs, TimeInForce::Day, greeks))
 }
 
+// ── Capital requirement estimate ─────────────────────────────────────────────
+// Returns the estimated capital needed to enter the order.
+// For equity options: 100 shares per contract.
+// For futures: no multiplier (margin is tracked separately by the FCM).
+// Debit orders → net debit is the max loss.
+// Credit orders → conservative estimate is 2× the credit received as margin.
+
+pub fn required_capital(order: &Order) -> f64 {
+    let is_futures = order.legs.iter()
+        .any(|l| matches!(l.instrument, Instrument::Future | Instrument::FutureOption));
+    let multiplier = if is_futures { 1.0 } else { 100.0 };
+
+    let net_debit: f64 = order.legs.iter().map(|l| {
+        let price = l.limit_price.unwrap_or(0.0);
+        let cost  = price * l.quantity as f64 * multiplier;
+        match l.side {
+            crate::orders::OrderSide::Buy  =>  cost,
+            crate::orders::OrderSide::Sell => -cost,
+        }
+    }).sum();
+
+    if net_debit >= 0.0 {
+        net_debit           // debit trade — cost is the max loss
+    } else {
+        net_debit.abs() * 2.0  // credit trade — rough margin: 2× premium received
+    }
+}
+
 // ── Greeks aggregate for the proposed order ───────────────────────────────────
 
 pub fn estimate_order_greeks(
