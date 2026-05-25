@@ -11,11 +11,12 @@ Sistema de trading autónomo para opciones y futuros basado en el Zeta Field.
 | IPC | ZeroMQ PUSH/PULL | Julia PUSH → Rust PULL, `ipc:///tmp/zeta.sock` |
 | LLM Agent | Rust → Anthropic API | `claude-opus-4-7`, tool_use forzado, solo para señales ambiguas |
 
-## Estado del proyecto — actualizado 2026-05-24
+## Estado del proyecto — actualizado 2026-05-25
 
 ### Completado ✓
 - `zeta/src/data/thetadata.jl` — ThetaData v2 REST client (equity options Greeks 1st/2nd order)
 - `zeta/src/data/databento.jl` — Databento GLBX.MDP3 client (CME MBO/trades/definitions + OFI)
+- `zeta/src/data/chain.jl` — Chain parser con named-field access (fix TD-001), StrikeCandidate, filtros de liquidez
 - `zeta/src/greeks/black76.jl` — Black-76 pricing + Greeks 1st/2nd/3rd order + IV solver
 - `zeta/src/vol/surface.jl` — SVI vol surface fitting + smile metrics (RR25, BF25, skew, term structure)
 - `zeta/src/vol/hv.jl` — Rolling HV, GARCH(1,1), Hurst exponent, VRP
@@ -24,27 +25,28 @@ Sistema de trading autónomo para opciones y futuros basado en el Zeta Field.
 - `zeta/src/strategy/classifier.jl` — MarketEnvironment, 6 patrones de ambigüedad
 - `zeta/src/strategy/rules.jl` — select_candidates(): IronCondor, Strangle, Straddle, etc.
 - `zeta/src/strategy/sizing.jl` — Fractional Kelly, hard limits, run_rule_engine()
-- `zeta/src/ipc.jl` — ZMQ PUSH, send_signal(), send_heartbeat()
+- `zeta/src/ipc.jl` — ZMQ PUSH, send_signal() con chain_candidates, send_heartbeat()
 - `zeta/src/server.jl` — Main loop: carga historia → GARCH/HMM → field → ZMQ
 - `executor/src/data/` — ThetaData WS + Databento WS, tipos canónicos de eventos
 - `executor/src/orders/mod.rs` — OMS con live Greeks tracking, delta hedge trigger
 - `executor/src/orders/persistence.rs` — Append-only event log, replay/reconstruct en startup
-- `executor/src/broker/alpaca.rs` — Alpaca Markets (paper + live), multi-leg orders
+- `executor/src/execution/mod.rs` — build_order(): StrikeCandidate → OrderLeg[] para todos los strategy types
+- `executor/src/broker/tradier.rs` — Tradier (opciones + acciones): single-leg y multileg, form-encoded
+- `executor/src/broker/tradovate.rs` — Tradovate (futuros): OAuth2, placeOrder, demo/live
+- `executor/src/broker/mod.rs` — BrokerRouter: rutea por Instrument (EquityOption→Tradier, Future→Tradovate)
 - `executor/src/agent/` — Anthropic client, decision tool schema, prompt builder
-- `executor/src/ipc.rs` — ZMQ PULL bind, ZetaSignal deserialización
-- `executor/src/main.rs` — Event loop: data feeds + ZMQ + LLM agent routing
+- `executor/src/ipc.rs` — ZMQ PULL bind, ZetaSignal deserialización (incluye chain_candidates)
+- `executor/src/main.rs` — Event loop completo: data feeds + ZMQ + LLM + broker + EventLog
 - `deploy/` — systemd units, setup.sh, status.sh, on_executor_stop.sh
 - `docs/adr/` — ADR-0001 al ADR-0008
-
-### En progreso 🔧
-- Option chain → strikes concretos para órdenes (falta el último eslabón)
-  `StrategyDecision` → `OrderLeg` con strikes/expirations reales del chain
+- `docs/architecture.md` — 5 diagramas Mermaid: componentes, sequence, infra, ZetaState, árbol de decisión
 
 ### Pendiente 📋
-- IBKR integration (actualmente solo Alpaca)
+- Tradovate token refresh automático (tokens expiran ~24h) — añadir background task
 - Backtesting framework con datos históricos de ThetaData
 - Monitoring: exportar métricas del OMS a Grafana/Prometheus
 - SOC2 controls: encriptación en reposo del OMS log, acceso formal
+- Para futuros con capital real: Dorman Capital FCM (~$30k) — API vía Rithmic o plataforma nativa
 
 ---
 
@@ -52,13 +54,13 @@ Sistema de trading autónomo para opciones y futuros basado en el Zeta Field.
 
 | ID | Archivo | Descripción | Severidad |
 |----|---------|-------------|-----------|
-| TD-001 | `server.jl:_build_slices_from_chain()` | Usa índices posicionales del response de ThetaData. Frágil si cambia el orden de campos. Migrar a named fields. | Alta |
+| TD-001 | `server.jl:_build_slices_from_chain()` | ~~Usa índices posicionales~~ **RESUELTO**: `chain.jl` usa named fields vía `header.format` index dict | ~~Alta~~ ✓ |
 | TD-002 | `black76.jl:enrich_greeks()` | Recalcula delta con Black-Scholes en lugar de usar el delta que ya viene de ThetaData | Media |
 | TD-003 | `surface.jl:delta25_strike()` | Newton-Raphson sin fallback explícito. Puede no converger en condiciones extremas | Media |
 | TD-004 | `surface.jl` | No verifica arbitrage de calendario entre slices (total variance debe ser monótona en T) | Media |
 | TD-005 | `sizing.jl:_zscore_to_win_prob()` | Mapeo VRP z-score → probabilidad de win sin calibración histórica. Necesita backtesting. | Alta |
 | TD-006 | `persistence.rs` | `sizing_adjustment` del LLM no queda registrado en el event log del OMS | Baja |
-| TD-007 | `main.rs` | `oms_td` y `oms_db` se crean pero no se usan (variables muertas) | Baja |
+| TD-007 | `main.rs` | ~~`oms_td` y `oms_db` se crean pero no se usan~~ **RESUELTO** | ~~Baja~~ ✓ |
 
 ---
 
