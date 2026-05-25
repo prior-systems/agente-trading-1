@@ -1,0 +1,30 @@
+services:
+
+  executor:
+    build: ./executor
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      ZMQ_ENDPOINT: "tcp://0.0.0.0:5555"
+      OMS_LOG_PATH: "/data/oms.jsonl"
+      RUST_LOG: "info"
+    volumes:
+      - oms_data:/data
+    expose:
+      - "5555"
+
+  zeta-engine:
+    build: ./zeta
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      ZMQ_ENDPOINT: "tcp://executor:5555"
+      THETADATA_BASE: "http://host.docker.internal:25503/v3"
+    depends_on:
+      - executor
+    # Needed on Linux so host.docker.internal resolves to the Docker host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  oms_data:

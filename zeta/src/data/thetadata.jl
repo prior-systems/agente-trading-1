@@ -3,7 +3,8 @@ using HTTP, JSON3, Dates
 # ThetaData v3 — local Theta Terminal
 # The Theta Terminal desktop app must be running for these calls to work.
 # No authentication in HTTP requests; the terminal handles auth internally.
-const THETADATA_BASE = "http://127.0.0.1:25503/v3"
+# In Docker: set THETADATA_BASE=http://host.docker.internal:25503/v3
+const THETADATA_BASE = get(ENV, "THETADATA_BASE", "http://127.0.0.1:25503/v3")
 
 struct ThetaDataClient
     base_url::String
