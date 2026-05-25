@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const BASE_DEMO: &str = "https://demo.tradovate.com/v1";
 const BASE_LIVE: &str = "https://live.tradovate.com/v1";
@@ -31,9 +31,23 @@ struct AuthRequest<'a> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AuthResponse {
-    access_token:    Option<String>,
-    user_status:     Option<String>,
-    p_token:         Option<String>,   // for renewal
+    access_token: Option<String>,
+    user_status:  Option<String>,
+    #[serde(rename = "p-token")]
+    p_token:      Option<String>,   // short-lived renewal ticket
+    #[serde(rename = "p-time")]
+    p_time:       Option<String>,   // timestamp paired with p-token
+}
+
+// Renewal uses the p-token + p-time from the previous auth response
+#[derive(Serialize)]
+struct RenewRequest<'a> {
+    #[serde(rename = "p-ticket")]
+    p_ticket: &'a str,
+    #[serde(rename = "p-time")]
+    p_time:   &'a str,
+    #[serde(rename = "p-captcha")]
+    p_captcha: bool,
 }
 
 // ── Order placement ───────────────────────────────────────────────────────────
@@ -83,6 +97,9 @@ pub struct TradovateBroker {
     secret:       String,
     device_id:    String,
     access_token: Arc<RwLock<String>>,
+    // p-token + p-time for renewal without re-sending password
+    p_token:      Arc<RwLock<Option<String>>>,
+    p_time:       Arc<RwLock<Option<String>>>,
     account_id:   Arc<RwLock<i64>>,
     account_name: Arc<RwLock<String>>,
 }
@@ -105,6 +122,8 @@ impl TradovateBroker {
             secret,
             device_id,
             access_token: Arc::new(RwLock::new(String::new())),
+            p_token:      Arc::new(RwLock::new(None)),
+            p_time:       Arc::new(RwLock::new(None)),
             account_id:   Arc::new(RwLock::new(0)),
             account_name: Arc::new(RwLock::new(String::new())),
         };
@@ -142,8 +161,61 @@ impl TradovateBroker {
             .ok_or_else(|| anyhow::anyhow!("Tradovate auth: missing accessToken"))?;
 
         *self.access_token.write().await = token;
+        *self.p_token.write().await = resp.p_token;
+        *self.p_time.write().await  = resp.p_time;
+
         info!("Tradovate authenticated ({})", if self.base_url.contains("demo") { "demo" } else { "live" });
         Ok(())
+    }
+
+    // Renew using p-token (no password retransmission).
+    // Falls back to full re-auth if p-token is absent or expired.
+    async fn renew(&self) -> Result<()> {
+        let p_tok  = self.p_token.read().await.clone();
+        let p_time = self.p_time.read().await.clone();
+
+        if let (Some(ticket), Some(time)) = (p_tok, p_time) {
+            let url = format!("{}/auth/renewaccesstoken", self.base_url);
+            let req = RenewRequest { p_ticket: &ticket, p_time: &time, p_captcha: false };
+
+            let resp: AuthResponse = self.client
+                .post(&url)
+                .json(&req)
+                .send()
+                .await?
+                .json()
+                .await?;
+
+            if let Some(token) = resp.access_token {
+                *self.access_token.write().await = token;
+                *self.p_token.write().await = resp.p_token;
+                *self.p_time.write().await  = resp.p_time;
+                info!("Tradovate token renewed via p-token");
+                return Ok(());
+            }
+            warn!("Tradovate p-token renewal returned no accessToken — falling back to re-auth");
+        }
+
+        // Full re-auth fallback
+        self.authenticate().await
+    }
+
+    /// Spawn a background task that renews the token every 23 hours.
+    /// Call once after `connect()` — the task holds weak references via
+    /// the shared Arc fields, so it stops automatically when the broker drops.
+    pub fn spawn_refresh_task(self: &Arc<Self>) {
+        let broker = Arc::clone(self);
+        tokio::spawn(async move {
+            // Tradovate tokens live ~24h; renew at 23h to stay ahead
+            let interval = tokio::time::Duration::from_secs(23 * 3600);
+            loop {
+                tokio::time::sleep(interval).await;
+                match broker.renew().await {
+                    Ok(())  => {}
+                    Err(e)  => warn!("Tradovate token refresh failed: {} — will retry next cycle", e),
+                }
+            }
+        });
     }
 
     async fn load_account(&self) -> Result<()> {

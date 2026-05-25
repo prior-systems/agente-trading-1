@@ -54,6 +54,7 @@ async fn main() -> Result<()> {
             config.tradovate_demo,
         ).await?,
     );
+    tradovate.spawn_refresh_task();  // renew token every 23h in background
 
     let broker: Arc<dyn Broker> = Arc::new(BrokerRouter::new(tradier, tradovate));
 
