@@ -1,3 +1,4 @@
+use crate::data::OptionRight;
 use crate::orders::{Instrument, Order, OrderLeg, OrderSide, OrderType, TimeInForce};
 use anyhow::{bail, Result};
 use serde::Deserialize;
@@ -10,7 +11,7 @@ pub struct StrikeCandidate {
     pub root:             String,
     pub expiration:       String,   // YYYYMMDD
     pub strike:           f64,
-    pub right:            String,   // "call" or "put"
+    pub right:            OptionRight,
     pub dte:              i32,
     pub delta:            f64,
     pub gamma:            f64,
@@ -28,8 +29,8 @@ pub struct StrikeCandidate {
 }
 
 impl StrikeCandidate {
-    pub fn is_call(&self) -> bool { self.right == "call" }
-    pub fn is_put(&self)  -> bool { self.right == "put" }
+    pub fn is_call(&self) -> bool { self.right == OptionRight::Call }
+    pub fn is_put(&self)  -> bool { self.right == OptionRight::Put }
 
     // OCC option symbol: "ROOT YYMMDD[C/P]STRIKE"
     pub fn occ_symbol(&self) -> String {
@@ -356,13 +357,13 @@ mod tests {
     use super::*;
     use crate::agent::decision::StrategyDecision;
 
-    fn candidate(strike: f64, right: &str, delta: f64, dte: i32) -> StrikeCandidate {
+    fn candidate(strike: f64, right: OptionRight, delta: f64, dte: i32) -> StrikeCandidate {
         let bid = (delta.abs() * 8.0 + 0.05).max(0.05);
         let ask = bid * 1.10;
         StrikeCandidate {
             root: "SPY".into(),
             expiration: "20260624".into(),
-            strike, right: right.into(), dte, delta,
+            strike, right, dte, delta,
             gamma: 0.03, theta: -0.05, vega: 0.12, implied_vol: 0.18,
             bid, ask, mid: (bid + ask) / 2.0,
             bid_size: 150, ask_size: 120,
@@ -373,10 +374,10 @@ mod tests {
 
     fn iron_condor_candidates() -> Vec<StrikeCandidate> {
         vec![
-            candidate(545.0, "call",  0.16, 30),
-            candidate(552.0, "call",  0.05, 30),
-            candidate(515.0, "put",  -0.16, 30),
-            candidate(508.0, "put",  -0.05, 30),
+            candidate(545.0, OptionRight::Call,  0.16, 30),
+            candidate(552.0, OptionRight::Call,  0.05, 30),
+            candidate(515.0, OptionRight::Put,  -0.16, 30),
+            candidate(508.0, OptionRight::Put,  -0.05, 30),
         ]
     }
 

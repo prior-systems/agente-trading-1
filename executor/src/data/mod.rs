@@ -79,6 +79,7 @@ pub enum MarketEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]   // Julia sends "call" / "put"
 pub enum OptionRight { Call, Put }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

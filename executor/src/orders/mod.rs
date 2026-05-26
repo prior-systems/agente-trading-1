@@ -166,7 +166,7 @@ impl OrderManagementSystem {
         match event {
             MarketEvent::FuturesTrade(t) => {
                 let key = format!("FUT_{}", t.instrument_id);
-                if let Some(mut pos) = self.positions.get_mut(&key) {
+                if let Some(pos) = self.positions.get_mut(&key) {
                     let _ = t.price;
                     let _ = pos.delta;
                 }
@@ -174,13 +174,15 @@ impl OrderManagementSystem {
             MarketEvent::FuturesMBP1(m) => {
                 // Mid-price for mark-to-market; OFI flows to ZetaState via Julia
                 let key = format!("FUT_{}", m.instrument_id);
-                if let Some(mut pos) = self.positions.get_mut(&key) {
+                if let Some(pos) = self.positions.get_mut(&key) {
                     let mid = (m.bid_px + m.ask_px) / 2.0;
                     let _ = mid;
                     let _ = pos.delta;
                 }
             }
-            MarketEvent::FuturesMBO(_) | _ => {}
+            // Historical-only / equity events: not handled here. Listed
+            // explicitly so a new MarketEvent variant triggers a compile error.
+            MarketEvent::FuturesMBO(_) | MarketEvent::OptionQuote(_) => {}
         }
         Ok(())
     }
