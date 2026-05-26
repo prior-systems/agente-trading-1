@@ -255,6 +255,62 @@ pub fn required_capital(order: &Order) -> f64 {
     }
 }
 
+// ── Action planning (pure) ────────────────────────────────────────────────────
+// The deterministic core: given a decision and market state — with no I/O —
+// produce either a ready-to-submit Order or a reason to skip. Same inputs
+// always yield the same Action, so it is unit-testable without a broker,
+// LLM, or network. The caller performs the effects (fetch buying power,
+// submit, persist).
+
+#[derive(Debug)]
+pub enum Action {
+    Submit(Box<Order>),
+    Skip { reason: String },
+}
+
+pub fn plan_action(
+    decision:     &crate::agent::decision::StrategyDecision,
+    candidates:   &[StrikeCandidate],
+    greeks:       (f64, f64, f64, f64),
+    available_bp: f64,
+    strategy_id:  &str,
+) -> Action {
+    if !decision.approved || decision.contracts == 0 {
+        return Action::Skip { reason: format!("decision layer: {}", decision.reasoning) };
+    }
+
+    let final_contracts = decision.sizing_adjustment
+        .map(|adj| (decision.contracts as f64 * adj).round() as u32)
+        .unwrap_or(decision.contracts);
+
+    if final_contracts == 0 {
+        return Action::Skip {
+            reason: format!("sizing_adjustment rounded contracts to 0 (adj={:?})", decision.sizing_adjustment),
+        };
+    }
+
+    let order = match build_order(
+        &decision.strategy_type,
+        candidates,
+        final_contracts,
+        decision.target_dte,
+        strategy_id,
+        greeks,
+    ) {
+        Ok(o) => o,
+        Err(e) => return Action::Skip { reason: format!("order construction failed: {}", e) },
+    };
+
+    let needed = required_capital(&order);
+    if needed > available_bp {
+        return Action::Skip {
+            reason: format!("insufficient buying power: needed {:.0}, available {:.0}", needed, available_bp),
+        };
+    }
+
+    Action::Submit(Box::new(order))
+}
+
 // ── Greeks aggregate for the proposed order ───────────────────────────────────
 
 pub fn estimate_order_greeks(
@@ -290,5 +346,106 @@ pub fn estimate_order_greeks(
         "LongStrangle"  => sum_greeks(&[( 0.30, true, true),  (-0.30, false, true)]),
         "RiskReversal"  => sum_greeks(&[( 0.25, true, true),  (-0.25, false, false)]),
         _ => (0.0, 0.0, 0.0, 0.0),
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::decision::StrategyDecision;
+
+    fn candidate(strike: f64, right: &str, delta: f64, dte: i32) -> StrikeCandidate {
+        let bid = (delta.abs() * 8.0 + 0.05).max(0.05);
+        let ask = bid * 1.10;
+        StrikeCandidate {
+            root: "SPY".into(),
+            expiration: "20260624".into(),
+            strike, right: right.into(), dte, delta,
+            gamma: 0.03, theta: -0.05, vega: 0.12, implied_vol: 0.18,
+            bid, ask, mid: (bid + ask) / 2.0,
+            bid_size: 150, ask_size: 120,
+            underlying_price: 530.0, open_interest: 5000,
+            spread_pct: (ask - bid) / ask,
+        }
+    }
+
+    fn iron_condor_candidates() -> Vec<StrikeCandidate> {
+        vec![
+            candidate(545.0, "call",  0.16, 30),
+            candidate(552.0, "call",  0.05, 30),
+            candidate(515.0, "put",  -0.16, 30),
+            candidate(508.0, "put",  -0.05, 30),
+        ]
+    }
+
+    fn decision(approved: bool, strategy: &str, contracts: u32) -> StrategyDecision {
+        StrategyDecision {
+            approved,
+            strategy_type: strategy.into(),
+            contracts,
+            target_delta: 0.0, target_vega: -55.0, target_dte: 30,
+            entry_urgency: "patient".into(),
+            reasoning: "test".into(), confidence: 0.8,
+            macro_concerns: None, sizing_adjustment: None, conditional_trigger: None,
+        }
+    }
+
+    const NO_GREEKS: (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.0);
+
+    #[test]
+    fn skips_when_not_approved() {
+        let d = decision(false, "IronCondor", 1);
+        let a = plan_action(&d, &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid");
+        assert!(matches!(a, Action::Skip { .. }));
+    }
+
+    #[test]
+    fn skips_when_zero_contracts() {
+        let d = decision(true, "IronCondor", 0);
+        let a = plan_action(&d, &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid");
+        assert!(matches!(a, Action::Skip { .. }));
+    }
+
+    #[test]
+    fn submits_iron_condor_with_four_legs() {
+        let d = decision(true, "IronCondor", 1);
+        match plan_action(&d, &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid") {
+            Action::Submit(o) => assert_eq!(o.legs.len(), 4),
+            Action::Skip { reason } => panic!("expected submit, got skip: {reason}"),
+        }
+    }
+
+    #[test]
+    fn skips_when_insufficient_buying_power() {
+        let d = decision(true, "IronCondor", 1);
+        let a = plan_action(&d, &iron_condor_candidates(), NO_GREEKS, 1.0, "sid");
+        assert!(matches!(a, Action::Skip { .. }));
+    }
+
+    #[test]
+    fn sizing_adjustment_halves_contracts() {
+        let mut d = decision(true, "IronCondor", 2);
+        d.sizing_adjustment = Some(0.5);
+        match plan_action(&d, &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid") {
+            Action::Submit(o) => assert_eq!(o.legs[0].quantity, 1),
+            Action::Skip { reason } => panic!("expected submit, got skip: {reason}"),
+        }
+    }
+
+    #[test]
+    fn sizing_adjustment_rounding_to_zero_skips() {
+        let mut d = decision(true, "IronCondor", 1);
+        d.sizing_adjustment = Some(0.4);  // 1 × 0.4 = 0.4 → rounds to 0
+        let a = plan_action(&d, &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid");
+        assert!(matches!(a, Action::Skip { .. }));
+    }
+
+    #[test]
+    fn skips_when_candidates_missing() {
+        let d = decision(true, "IronCondor", 1);
+        let a = plan_action(&d, &[], NO_GREEKS, 50_000.0, "sid");
+        assert!(matches!(a, Action::Skip { .. }));
     }
 }

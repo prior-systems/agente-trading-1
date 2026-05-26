@@ -133,6 +133,24 @@ async fn main() -> Result<()> {
     }
 }
 
+// Pure: the decision used when the rule-engine signal is unambiguous (no LLM).
+fn rule_engine_decision(p: &ipc::RuleProposalMsg) -> agent::decision::StrategyDecision {
+    agent::decision::StrategyDecision {
+        approved:            true,
+        strategy_type:       p.strategy_type.clone(),
+        contracts:           p.contracts,
+        target_delta:        p.est_delta,
+        target_vega:         p.est_vega,
+        target_dte:          p.target_dte,
+        entry_urgency:       p.entry_urgency.clone(),
+        reasoning:           "Rule engine clear signal — no LLM review needed.".to_string(),
+        confidence:          0.85,
+        macro_concerns:      None,
+        sizing_adjustment:   None,
+        conditional_trigger: None,
+    }
+}
+
 async fn handle_zeta_signal(
     signal: ipc::ZetaSignal,
     oms:    Arc<OrderManagementSystem>,
@@ -140,7 +158,7 @@ async fn handle_zeta_signal(
     broker: Arc<dyn Broker>,
     log:    Arc<EventLog>,
 ) -> Result<()> {
-    // ── Decision ──────────────────────────────────────────────────────────────
+    // ── Effect: decision (LLM consult or rule-engine passthrough) ──────────────
     let decision = if signal.needs_llm {
         agent.consult(
             &signal.zeta_context,
@@ -148,44 +166,13 @@ async fn handle_zeta_signal(
             &signal.proposal.clone().into(),
         ).await?
     } else {
-        agent::decision::StrategyDecision {
-            approved:            true,
-            strategy_type:       signal.proposal.strategy_type.clone(),
-            contracts:           signal.proposal.contracts,
-            target_delta:        signal.proposal.est_delta,
-            target_vega:         signal.proposal.est_vega,
-            target_dte:          signal.proposal.target_dte,
-            entry_urgency:       signal.proposal.entry_urgency.clone(),
-            reasoning:           "Rule engine clear signal — no LLM review needed.".to_string(),
-            confidence:          0.85,
-            macro_concerns:      None,
-            sizing_adjustment:   None,
-            conditional_trigger: None,
-        }
+        rule_engine_decision(&signal.proposal)
     };
 
-    if !decision.approved || decision.contracts == 0 {
-        info!(
-            strategy  = %decision.strategy_type,
-            reasoning = %decision.reasoning,
-            "Trade blocked by decision layer"
-        );
-        return Ok(());
-    }
+    // ── Effect: query available capital ────────────────────────────────────────
+    let available_bp = broker.account_buying_power().await.unwrap_or(0.0);
 
-    let final_contracts = decision.sizing_adjustment
-        .map(|adj| (decision.contracts as f64 * adj).round() as u32)
-        .unwrap_or(decision.contracts);
-
-    info!(
-        strategy   = %decision.strategy_type,
-        contracts  = final_contracts,
-        urgency    = %decision.entry_urgency,
-        confidence = decision.confidence,
-        "Executing approved trade"
-    );
-
-    // ── Order construction ────────────────────────────────────────────────────
+    // ── Pure: decide what to do (deterministic, no I/O) ────────────────────────
     let greeks = (
         signal.proposal.est_delta,
         0.0,
@@ -194,54 +181,32 @@ async fn handle_zeta_signal(
     );
     let strategy_id = uuid::Uuid::new_v4().to_string();
 
-    let mut order = match execution::build_order(
-        &decision.strategy_type,
-        &signal.chain_candidates,
-        final_contracts,
-        decision.target_dte,
-        &strategy_id,
-        greeks,
+    let mut order = match execution::plan_action(
+        &decision, &signal.chain_candidates, greeks, available_bp, &strategy_id,
     ) {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::warn!(
-                strategy   = %decision.strategy_type,
-                candidates = signal.chain_candidates.len(),
-                error      = %e,
-                "Order construction failed — no trade submitted"
-            );
+        execution::Action::Skip { reason } => {
+            info!(strategy = %decision.strategy_type, %reason, "Trade not submitted");
             return Ok(());
         }
+        execution::Action::Submit(order) => *order,
     };
 
-    // ── Buying power gate ─────────────────────────────────────────────────────
-    let needed    = execution::required_capital(&order);
-    let available = broker.account_buying_power().await.unwrap_or(0.0);
-
-    if needed > available {
-        tracing::warn!(
-            strategy  = %decision.strategy_type,
-            needed    = needed,
-            available = available,
-            "Trade blocked — insufficient buying power"
-        );
-        return Ok(());
-    }
-
+    // ── Effects: submit, stage, persist ────────────────────────────────────────
     let leg_summary: Vec<_> = order.legs.iter()
         .map(|l| format!("{:?} {} x{}", l.side, l.symbol, l.quantity))
         .collect();
-    info!(legs = ?leg_summary, needed, available, "Submitting to broker");
+    info!(
+        strategy   = %decision.strategy_type,
+        confidence = decision.confidence,
+        legs       = ?leg_summary,
+        bp         = available_bp,
+        "Executing approved trade — submitting to broker"
+    );
 
-    // ── Broker submission ─────────────────────────────────────────────────────
     let broker_id = match broker.submit_order(&order).await {
         Ok(id) => id,
         Err(e) => {
-            tracing::error!(
-                strategy = %decision.strategy_type,
-                error    = %e,
-                "Broker submission failed"
-            );
+            tracing::error!(strategy = %decision.strategy_type, error = %e, "Broker submission failed");
             return Ok(());
         }
     };
@@ -251,7 +216,6 @@ async fn handle_zeta_signal(
     order.broker_id = Some(broker_id.clone());
     order.status    = orders::OrderStatus::Submitted;
 
-    // ── Stage in OMS + persist ────────────────────────────────────────────────
     let order_id = oms.submit(order.clone());
     log.append(&ev_submitted(order)).await?;
 
