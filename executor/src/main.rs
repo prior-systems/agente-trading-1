@@ -8,7 +8,9 @@ mod orders;
 use agent::StrategyAgent;
 use anyhow::Result;
 use broker::{Broker, BrokerRouter};
-use orders::{persistence::{ev_start, ev_submitted, EventLog}, OrderManagementSystem};
+use orders::{persistence::{
+    ev_start, ev_submitted, ev_signal_received, ev_decision_made, ev_action_planned, EventLog,
+}, OrderManagementSystem};
 use std::sync::Arc;
 use tracing::info;
 
@@ -151,6 +153,18 @@ fn rule_engine_decision(p: &ipc::RuleProposalMsg) -> agent::decision::StrategyDe
     }
 }
 
+// Deterministic content hash of the signal's inputs — UUID v5(SHA1) of the
+// key fields. Same market state + same proposal → same hash, enabling
+// LLM response caching in the future backtester.
+fn signal_request_hash(signal: &ipc::ZetaSignal) -> String {
+    let data = format!("{}|{}|{}",
+        signal.zeta_context,
+        signal.proposal.strategy_type,
+        signal.proposal.contracts,
+    );
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, data.as_bytes()).to_string()
+}
+
 async fn handle_zeta_signal(
     signal: ipc::ZetaSignal,
     oms:    Arc<OrderManagementSystem>,
@@ -158,21 +172,49 @@ async fn handle_zeta_signal(
     broker: Arc<dyn Broker>,
     log:    Arc<EventLog>,
 ) -> Result<()> {
+    let signal_id    = uuid::Uuid::new_v4().to_string();
+    let request_hash = signal_request_hash(&signal);
+
+    // ── Persist: signal arrived ────────────────────────────────────────────────
+    log.append(&ev_signal_received(
+        &signal_id, &signal.symbol, &signal.proposal.strategy_type,
+        signal.needs_llm, &signal.zeta_context,
+    )).await?;
+
     // ── Effect: decision (LLM consult or rule-engine passthrough) ──────────────
-    let decision = if signal.needs_llm {
-        agent.consult(
+    let (decision, decision_source) = if signal.needs_llm {
+        let raw = agent.consult(
             &signal.zeta_context,
             &signal.llm_questions,
             &signal.proposal.clone().into(),
-        ).await?
+        ).await?;
+        match execution::validate_llm_decision(raw, signal.proposal.contracts) {
+            Ok(v)  => (v, "llm"),
+            Err(e) => {
+                tracing::warn!(signal_id = %signal_id, error = %e, "LLM decision failed validation — skipping signal");
+                log.append(&ev_action_planned(&signal_id, "Skip",
+                    &format!("llm_validation_failed: {e}"))).await?;
+                return Ok(());
+            }
+        }
     } else {
-        rule_engine_decision(&signal.proposal)
+        let d = execution::ValidatedDecision::from_rule_engine(rule_engine_decision(&signal.proposal));
+        (d, "rule_engine")
     };
+
+    // ── Persist: decision recorded as immutable fact ───────────────────────────
+    log.append(&ev_decision_made(
+        &signal_id, decision_source, &request_hash,
+        decision.inner().approved,
+        &decision.inner().reasoning,
+        decision.inner().confidence,
+        decision.inner().sizing_adjustment,
+    )).await?;
 
     // ── Effect: query available capital ────────────────────────────────────────
     let available_bp = broker.account_buying_power().await.unwrap_or(0.0);
 
-    // ── Pure: decide what to do (deterministic, no I/O) ────────────────────────
+    // ── Pure: plan action (deterministic, no I/O) ─────────────────────────────
     let greeks = (
         signal.proposal.est_delta,
         0.0,
@@ -184,11 +226,15 @@ async fn handle_zeta_signal(
     let mut order = match execution::plan_action(
         &decision, &signal.chain_candidates, greeks, available_bp, &strategy_id,
     ) {
-        execution::Action::Skip { reason } => {
-            info!(strategy = %decision.strategy_type, %reason, "Trade not submitted");
+        execution::Action::Skip { ref reason } => {
+            log.append(&ev_action_planned(&signal_id, "Skip", reason)).await?;
+            info!(strategy = %decision.inner().strategy_type, %reason, "Trade not submitted");
             return Ok(());
         }
-        execution::Action::Submit(order) => *order,
+        execution::Action::Submit(order) => {
+            log.append(&ev_action_planned(&signal_id, "Submit", &order.id.to_string())).await?;
+            *order
+        }
     };
 
     // ── Effects: submit, stage, persist ────────────────────────────────────────
@@ -196,8 +242,8 @@ async fn handle_zeta_signal(
         .map(|l| format!("{:?} {} x{}", l.side, l.symbol, l.quantity))
         .collect();
     info!(
-        strategy   = %decision.strategy_type,
-        confidence = decision.confidence,
+        strategy   = %decision.inner().strategy_type,
+        confidence = decision.inner().confidence,
         legs       = ?leg_summary,
         bp         = available_bp,
         "Executing approved trade — submitting to broker"
@@ -206,7 +252,11 @@ async fn handle_zeta_signal(
     let broker_id = match broker.submit_order(&order).await {
         Ok(id) => id,
         Err(e) => {
-            tracing::error!(strategy = %decision.strategy_type, error = %e, "Broker submission failed");
+            tracing::error!(
+                strategy = %decision.inner().strategy_type,
+                error    = %e,
+                "Broker submission failed"
+            );
             return Ok(());
         }
     };

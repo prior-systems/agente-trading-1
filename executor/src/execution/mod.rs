@@ -256,6 +256,50 @@ pub fn required_capital(order: &Order) -> f64 {
     }
 }
 
+// ── ValidatedDecision — proof-carrying type ──────────────────────────────────
+// A StrategyDecision that has passed semantic bounds checking at the system
+// boundary. Two creation paths:
+//   1. validate_llm_decision() — for LLM responses (external, untrusted input)
+//   2. ValidatedDecision::from_rule_engine() — for rule engine (internal, trusted)
+// plan_action accepts only this type, making it impossible to skip validation.
+
+pub struct ValidatedDecision(crate::agent::decision::StrategyDecision);
+
+impl ValidatedDecision {
+    pub fn inner(&self) -> &crate::agent::decision::StrategyDecision { &self.0 }
+
+    pub(crate) fn from_rule_engine(d: crate::agent::decision::StrategyDecision) -> Self {
+        ValidatedDecision(d)
+    }
+}
+
+/// Validate a raw LLM-produced StrategyDecision against semantic bounds.
+/// Returns Err with a human-readable message if any bound is violated.
+/// Caller should log the error, append an ActionPlanned(Skip) event, and return Ok(()).
+pub fn validate_llm_decision(
+    raw:                crate::agent::decision::StrategyDecision,
+    proposal_contracts: u32,
+) -> Result<ValidatedDecision> {
+    if raw.reasoning.trim().is_empty() {
+        bail!("reasoning is empty — possible truncated LLM response");
+    }
+    if !(0.0..=1.0).contains(&raw.confidence) {
+        bail!("confidence {:.3} outside [0, 1]", raw.confidence);
+    }
+    if let Some(adj) = raw.sizing_adjustment {
+        if !(0.0..=2.0).contains(&adj) {
+            bail!("sizing_adjustment {:.3} outside [0, 2]", adj);
+        }
+    }
+    // LLM cannot increase contract count beyond 3× what the rule engine proposed.
+    // Any value above this signals either hallucination or a prompt injection attempt.
+    let ceiling = (proposal_contracts.saturating_mul(3)).max(10);
+    if raw.contracts > ceiling {
+        bail!("contracts {} exceeds 3× proposal ceiling ({})", raw.contracts, ceiling);
+    }
+    Ok(ValidatedDecision(raw))
+}
+
 // ── Action planning (pure) ────────────────────────────────────────────────────
 // The deterministic core: given a decision and market state — with no I/O —
 // produce either a ready-to-submit Order or a reason to skip. Same inputs
@@ -270,31 +314,32 @@ pub enum Action {
 }
 
 pub fn plan_action(
-    decision:     &crate::agent::decision::StrategyDecision,
+    decision:     &ValidatedDecision,
     candidates:   &[StrikeCandidate],
     greeks:       (f64, f64, f64, f64),
     available_bp: f64,
     strategy_id:  &str,
 ) -> Action {
-    if !decision.approved || decision.contracts == 0 {
-        return Action::Skip { reason: format!("decision layer: {}", decision.reasoning) };
+    let d = decision.inner();
+    if !d.approved || d.contracts == 0 {
+        return Action::Skip { reason: format!("decision layer: {}", d.reasoning) };
     }
 
-    let final_contracts = decision.sizing_adjustment
-        .map(|adj| (decision.contracts as f64 * adj).round() as u32)
-        .unwrap_or(decision.contracts);
+    let final_contracts = d.sizing_adjustment
+        .map(|adj| (d.contracts as f64 * adj).round() as u32)
+        .unwrap_or(d.contracts);
 
     if final_contracts == 0 {
         return Action::Skip {
-            reason: format!("sizing_adjustment rounded contracts to 0 (adj={:?})", decision.sizing_adjustment),
+            reason: format!("sizing_adjustment rounded contracts to 0 (adj={:?})", d.sizing_adjustment),
         };
     }
 
     let order = match build_order(
-        &decision.strategy_type,
+        &d.strategy_type,
         candidates,
         final_contracts,
-        decision.target_dte,
+        d.target_dte,
         strategy_id,
         greeks,
     ) {
@@ -357,6 +402,10 @@ mod tests {
     use super::*;
     use crate::agent::decision::StrategyDecision;
 
+    fn validated(d: StrategyDecision) -> ValidatedDecision {
+        ValidatedDecision::from_rule_engine(d)
+    }
+
     fn candidate(strike: f64, right: OptionRight, delta: f64, dte: i32) -> StrikeCandidate {
         let bid = (delta.abs() * 8.0 + 0.05).max(0.05);
         let ask = bid * 1.10;
@@ -398,21 +447,21 @@ mod tests {
     #[test]
     fn skips_when_not_approved() {
         let d = decision(false, "IronCondor", 1);
-        let a = plan_action(&d, &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid");
+        let a = plan_action(&validated(d), &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid");
         assert!(matches!(a, Action::Skip { .. }));
     }
 
     #[test]
     fn skips_when_zero_contracts() {
         let d = decision(true, "IronCondor", 0);
-        let a = plan_action(&d, &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid");
+        let a = plan_action(&validated(d), &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid");
         assert!(matches!(a, Action::Skip { .. }));
     }
 
     #[test]
     fn submits_iron_condor_with_four_legs() {
         let d = decision(true, "IronCondor", 1);
-        match plan_action(&d, &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid") {
+        match plan_action(&validated(d), &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid") {
             Action::Submit(o) => assert_eq!(o.legs.len(), 4),
             Action::Skip { reason } => panic!("expected submit, got skip: {reason}"),
         }
@@ -421,7 +470,7 @@ mod tests {
     #[test]
     fn skips_when_insufficient_buying_power() {
         let d = decision(true, "IronCondor", 1);
-        let a = plan_action(&d, &iron_condor_candidates(), NO_GREEKS, 1.0, "sid");
+        let a = plan_action(&validated(d), &iron_condor_candidates(), NO_GREEKS, 1.0, "sid");
         assert!(matches!(a, Action::Skip { .. }));
     }
 
@@ -429,7 +478,7 @@ mod tests {
     fn sizing_adjustment_halves_contracts() {
         let mut d = decision(true, "IronCondor", 2);
         d.sizing_adjustment = Some(0.5);
-        match plan_action(&d, &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid") {
+        match plan_action(&validated(d), &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid") {
             Action::Submit(o) => assert_eq!(o.legs[0].quantity, 1),
             Action::Skip { reason } => panic!("expected submit, got skip: {reason}"),
         }
@@ -439,14 +488,57 @@ mod tests {
     fn sizing_adjustment_rounding_to_zero_skips() {
         let mut d = decision(true, "IronCondor", 1);
         d.sizing_adjustment = Some(0.4);  // 1 × 0.4 = 0.4 → rounds to 0
-        let a = plan_action(&d, &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid");
+        let a = plan_action(&validated(d), &iron_condor_candidates(), NO_GREEKS, 50_000.0, "sid");
         assert!(matches!(a, Action::Skip { .. }));
     }
 
     #[test]
     fn skips_when_candidates_missing() {
         let d = decision(true, "IronCondor", 1);
-        let a = plan_action(&d, &[], NO_GREEKS, 50_000.0, "sid");
+        let a = plan_action(&validated(d), &[], NO_GREEKS, 50_000.0, "sid");
         assert!(matches!(a, Action::Skip { .. }));
+    }
+
+    // ── validate_llm_decision tests ──────────────────────────────────────────
+
+    #[test]
+    fn validate_accepts_well_formed_decision() {
+        let d = decision(true, "IronCondor", 2);
+        assert!(validate_llm_decision(d, 2).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_reasoning() {
+        let mut d = decision(true, "IronCondor", 1);
+        d.reasoning = "   ".to_string();
+        assert!(validate_llm_decision(d, 1).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_sizing_adjustment_above_two() {
+        let mut d = decision(true, "IronCondor", 1);
+        d.sizing_adjustment = Some(2.1);
+        assert!(validate_llm_decision(d, 1).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_confidence_out_of_range() {
+        let mut d = decision(true, "IronCondor", 1);
+        d.confidence = 1.5;
+        assert!(validate_llm_decision(d, 1).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_contracts_above_ceiling() {
+        // ceiling = max(3 * 2, 10) = 10; 11 > 10 → rejected
+        let d = decision(true, "IronCondor", 11);
+        assert!(validate_llm_decision(d, 2).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_contracts_at_ceiling() {
+        // ceiling = max(3 * 2, 10) = 10; exactly 10 → accepted
+        let d = decision(true, "IronCondor", 10);
+        assert!(validate_llm_decision(d, 2).is_ok());
     }
 }

@@ -56,6 +56,31 @@ pub enum OmsEvent {
         ts:     String,
         reason: String,
     },
+    // Signal pipeline audit trail — links signal → decision → action together via signal_id
+    SignalReceived {
+        ts:                   String,
+        signal_id:            String,
+        symbol:               String,
+        strategy_type:        String,
+        needs_llm:            bool,
+        zeta_context_preview: String,   // first 200 chars — enough for audit, not bloat
+    },
+    DecisionMade {
+        ts:                String,
+        signal_id:         String,
+        source:            String,      // "llm" | "rule_engine"
+        request_hash:      String,      // UUID v5 of inputs — enables LLM response caching
+        approved:          bool,
+        reasoning:         String,
+        confidence:        f64,
+        sizing_adjustment: Option<f64>,
+    },
+    ActionPlanned {
+        ts:        String,
+        signal_id: String,
+        action:    String,   // "Submit" | "Skip"
+        detail:    String,   // order UUID if Submit, skip reason if Skip
+    },
 }
 
 pub struct EventLog {
@@ -145,6 +170,9 @@ impl EventLog {
                 }
                 OmsEvent::SystemStop { .. } => {}
                 OmsEvent::GreeksUpdated { .. } => {}  // live data, not reconstructed
+                OmsEvent::SignalReceived { .. } => {}  // audit only
+                OmsEvent::DecisionMade { .. }   => {}  // audit only
+                OmsEvent::ActionPlanned { .. }  => {}  // audit only
             }
         }
 
@@ -212,5 +240,52 @@ pub fn ev_cancelled(order_id: &str, reason: impl Into<String>) -> OmsEvent {
         ts:       Utc::now().to_rfc3339(),
         order_id: order_id.to_string(),
         reason:   reason.into(),
+    }
+}
+
+pub fn ev_signal_received(
+    signal_id:     &str,
+    symbol:        &str,
+    strategy_type: &str,
+    needs_llm:     bool,
+    zeta_context:  &str,
+) -> OmsEvent {
+    OmsEvent::SignalReceived {
+        ts:                   Utc::now().to_rfc3339(),
+        signal_id:            signal_id.to_string(),
+        symbol:               symbol.to_string(),
+        strategy_type:        strategy_type.to_string(),
+        needs_llm,
+        zeta_context_preview: zeta_context.chars().take(200).collect(),
+    }
+}
+
+pub fn ev_decision_made(
+    signal_id:         &str,
+    source:            &str,
+    request_hash:      &str,
+    approved:          bool,
+    reasoning:         &str,
+    confidence:        f64,
+    sizing_adjustment: Option<f64>,
+) -> OmsEvent {
+    OmsEvent::DecisionMade {
+        ts:                Utc::now().to_rfc3339(),
+        signal_id:         signal_id.to_string(),
+        source:            source.to_string(),
+        request_hash:      request_hash.to_string(),
+        approved,
+        reasoning:         reasoning.to_string(),
+        confidence,
+        sizing_adjustment,
+    }
+}
+
+pub fn ev_action_planned(signal_id: &str, action: &str, detail: &str) -> OmsEvent {
+    OmsEvent::ActionPlanned {
+        ts:        Utc::now().to_rfc3339(),
+        signal_id: signal_id.to_string(),
+        action:    action.to_string(),
+        detail:    detail.to_string(),
     }
 }
